@@ -130,7 +130,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        if iteration >= num_cameras*100:
+        if iteration >= num_cameras*60:
             render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE , num_count=True)
         else:
             render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE , num_count=False)
@@ -178,8 +178,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Select the first currently flagged Gaussian for this iteration.
         # The selected index is written to the CSV because it may change over time.
 
-        # num_cameras * 100 
-        if iteration > num_cameras * 100:
+        # num_cameras * 60 
+        if iteration > num_cameras * 60:
             if selected_debug_id is None:
                 flagged_ids = torch.where(
                     gaussians._gaussian_scene_num[:, 0] > 0.5
@@ -292,7 +292,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if debug_flagged:
                     debug_count = int(gaussians.error_history_count[debug_id].item())
 
-            # num_cameras * 100 
+            # num_cameras * 60 
             debug_csv.writerow([
                 iteration, debug_id, debug_flagged, debug_count, vind,
                 *debug_xyz, *debug_raw_grad, *debug_quad_grad,
