@@ -91,6 +91,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     selected_debug_id = None
+    selected_debug_uid = None
     
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
@@ -130,7 +131,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        if iteration >= num_cameras*60:
+        if iteration >= num_cameras*40:
             render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE , num_count=True)
         else:
             render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE , num_count=False)
@@ -174,18 +175,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss.backward()
 
 #########
-        # Snapshot the unmodified autograd gradient before applying the fitted direction.
-        # Select the first currently flagged Gaussian for this iteration.
-        # The selected index is written to the CSV because it may change over time.
+        # Select a flagged, visible Gaussian from the far-depth group, then
+        # prefer the one with the largest opacity-weighted screen footprint.
+        # This is a practical proxy for contribution; exact composited contribution
+        # would require an additional per-Gaussian output from the rasterizer.
 
-        # num_cameras * 60 
-        if iteration > num_cameras * 60:
-            if selected_debug_id is None:
-                flagged_ids = torch.where(
-                    gaussians._gaussian_scene_num[:, 0] > 0.5
+        # num_cameras * 60
+        if iteration > num_cameras * 40:
+            if selected_debug_uid is None:
+                flagged_visible = (
+                    (gaussians._gaussian_scene_num[:, 0] > 0.5)
+                    & (radii > 0)
+                )
+                candidate_ids = torch.where(flagged_visible)[0]
+                if candidate_ids.numel() > 0:
+                    view = viewpoint_cam.world_view_transform.to(gaussians._xyz.device)
+                    candidate_xyz = gaussians._xyz.detach()[candidate_ids]
+                    candidate_cam = candidate_xyz @ view[:3, :3] + view[3, :3]
+                    candidate_depth = candidate_cam[:, 2]
+
+                    # Treat the deepest 20% of flagged visible Gaussians as
+                    # background candidates.
+                    depth_threshold = torch.quantile(candidate_depth, 0.8)
+                    background_mask = candidate_depth >= depth_threshold
+                    background_ids = candidate_ids[background_mask]
+
+                    # Approximate image contribution by opacity times projected area.
+                    opacity = gaussians.get_opacity[background_ids, 0]
+                    projected_area = radii[background_ids].to(opacity.dtype).square()
+                    importance = opacity * projected_area
+                    best_local = torch.argmax(importance)
+                    selected_debug_id = int(background_ids[best_local].item())
+                    selected_debug_uid = int(gaussians._gaussian_uid[selected_debug_id].item())
+
+            # Resolve the stable UID every iteration because pruning compacts indices.
+            if selected_debug_uid is not None:
+                current_matches = torch.where(
+                    gaussians._gaussian_uid == selected_debug_uid
                 )[0]
-                if flagged_ids.numel() > 0:
-                    selected_debug_id = int(flagged_ids[0].item())
+                selected_debug_id = (
+                    int(current_matches[0].item()) if current_matches.numel() > 0 else None
+                )
 
             debug_id = selected_debug_id if selected_debug_id is not None else -1
             debug_id_valid = 0 <= debug_id < gaussians._xyz.shape[0]
@@ -209,8 +239,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             )
             debug_status = (
                 "flagged_waiting_for_history" if debug_flagged
-                else "waiting_for_flagged_gaussian" if selected_debug_id is None
-                else "selected_gaussian_missing" if not debug_id_valid
+                else "waiting_for_flagged_gaussian" if selected_debug_uid is None
+                else "tracked_gaussian_pruned" if selected_debug_id is None
                 else "selected_gaussian_unflagged"
             )
 
@@ -231,68 +261,71 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     q_cam = xyz_cam - grad_cam  # requested -gradient candidate location
                     line_origin = (q_cam - t) @ R_inv
                     z_axis = torch.tensor([0., 0., 1.], device=xyz.device, dtype=xyz.dtype)
+                    
                     line_dir = (z_axis @ R_inv).expand_as(line_origin)
                     line_dir = torch.nn.functional.normalize(line_dir, dim=-1)
 
-                    K = 5
-                    decay = 0.7
-                    for local, gid_tensor in enumerate(ids):
-                        gid = int(gid_tensor.item())
-                        count = int(gaussians.error_history_count[gid].item())
-                        ptr = int(gaussians.error_history_ptr[gid].item())
-                        target_sum = torch.zeros(3, device=xyz.device, dtype=xyz.dtype)
-                        weight_sum = 0.0
+                    has_history = gaussians.error_history_count[ids] > 0
+                    p2 = gaussians.error_line_origin_history[ids, 0]  # [M, 3]
+                    d2 = gaussians.error_line_dir_history[ids, 0]     # [M, 3]
 
-                        # Compare the new line with stored lines. Ignore nearly parallel
-                        # pairs because their closest points are numerically unstable.
-                        for age in range(count):
-                            hist_slot = (ptr - 1 - age) % K
-                            p2 = gaussians.error_line_origin_history[gid, hist_slot]
-                            d2 = gaussians.error_line_dir_history[gid, hist_slot]
-                            if torch.linalg.vector_norm(d2) < 1e-8:
-                                continue
-                            d1 = line_dir[local]
-                            w0 = line_origin[local] - p2
-                            b = torch.dot(d1, d2)
-                            d = torch.dot(d1, w0)
-                            e = torch.dot(d2, w0)
-                            denom = 1.0 - b * b
-                            if denom < 1e-4:
-                                continue
-                            s_line = (b * e - d) / denom
-                            t_line = (e - b * d) / denom
-                            c1 = line_origin[local] + s_line * d1
-                            c2 = p2 + t_line * d2
-                            midpoint = 0.5 * (c1 + c2)
-                            weight = decay ** age
-                            target_sum += weight * midpoint
-                            weight_sum += weight
 
-                        if weight_sum > 0.0:
-                            target = target_sum / weight_sum
-                            desired_grad = xyz[local] - target
-                            desired_norm = torch.linalg.vector_norm(desired_grad)
-                            raw_norm = torch.linalg.vector_norm(raw_grad[local])
-                            if torch.isfinite(desired_grad).all() and desired_norm > 1e-8 and raw_norm > 1e-12:
-                                gaussians._xyz.grad[gid] = desired_grad / desired_norm * raw_norm
-                                if gid == debug_id:
-                                    debug_quad_grad = [float(v) for v in desired_grad.cpu().tolist()]
-                                    debug_applied_grad = _csv_vec(gaussians._xyz.grad, gid)
-                                    debug_candidate = [float(v) for v in target.cpu().tolist()]
-                                    debug_status = "line_midpoint_gradient_applied"
+                    d1 = line_dir
+                    w0 = line_origin - p2
 
-                        # Insert newest line after comparison so it is not paired with itself.
-                        slot = ptr % K
-                        gaussians.error_line_origin_history[gid, slot] = line_origin[local]
-                        gaussians.error_line_dir_history[gid, slot] = line_dir[local]
-                        gaussians.error_camera_history[gid, slot] = vind
-                        gaussians.error_history_ptr[gid] = (slot + 1) % K
-                        gaussians.error_history_count[gid] = min(count + 1, K)
+                    b = (d1 * d2).sum(dim=-1)
+                    d = (d1 * w0).sum(dim=-1)
+                    e = (d2 * w0).sum(dim=-1)
+                    denom = 1.0 - b.square()
+
+                    valid_pair = has_history & (denom >= 1e-4)
+
+                    safe_denom = torch.where(valid_pair, denom, torch.ones_like(denom))
+                    s_line = (b * e - d) / safe_denom
+                    t_line = (e - b * d) / safe_denom
+
+                    c1 = line_origin + s_line[:, None] * d1
+                    c2 = p2 + t_line[:, None] * d2
+                    target = 0.5 * (c1 + c2)
+
+                    desired_grad = xyz - target
+                    desired_norm = torch.linalg.vector_norm(desired_grad, dim=-1)
+                    raw_norm = torch.linalg.vector_norm(raw_grad, dim=-1)
+
+                    valid_update = (
+                        valid_pair
+                        & torch.isfinite(desired_grad).all(dim=-1)
+                        & (desired_norm > 1e-8)
+                        & (raw_norm > 1e-12)
+                        & (iteration > num_cameras * 60)
+                    )
+
+                    new_grad = desired_grad / desired_norm.clamp_min(1e-8)[:, None]
+                    new_grad = new_grad * raw_norm[:, None]
+
+
+                    gaussians._xyz.grad[ids[valid_update]] = new_grad[valid_update]
+
+                    debug_local = torch.where(ids == debug_id)[0]
+                    if debug_local.numel() > 0:
+                        j = debug_local[0]
+                        if valid_update[j]:
+                            debug_quad_grad = [float(v) for v in desired_grad[j].cpu().tolist()]
+                            debug_applied_grad = _csv_vec(gaussians._xyz.grad, debug_id)
+                            debug_candidate = [float(v) for v in target[j].cpu().tolist()]
+                            debug_status = "new_applied"
+
+                    # 
+                    gaussians.error_line_origin_history[ids, 0] = line_origin
+                    gaussians.error_line_dir_history[ids, 0] = line_dir
+                    gaussians.error_camera_history[ids, 0] = vind
+                    gaussians.error_history_ptr[ids] = 0
+                    gaussians.error_history_count[ids] = 1
 
                 if debug_flagged:
                     debug_count = int(gaussians.error_history_count[debug_id].item())
 
-            # num_cameras * 60 
+
             debug_csv.writerow([
                 iteration, debug_id, debug_flagged, debug_count, vind,
                 *debug_xyz, *debug_raw_grad, *debug_quad_grad,

@@ -59,6 +59,8 @@ class GaussianModel:
         self._opacity = torch.empty(0)
 
         self._gaussian_scene_num = torch.empty(0)
+        self._gaussian_uid = torch.empty(0, dtype=torch.int64)
+        self._next_gaussian_uid = 0
 
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
@@ -88,6 +90,8 @@ class GaussianModel:
             self.error_camera_history,
             self.error_history_ptr,
             self.error_history_count,
+            self._gaussian_uid,
+            self._next_gaussian_uid,
         )
     
     def restore(self, model_args, training_args):
@@ -116,10 +120,16 @@ class GaussianModel:
                 self.error_history_ptr,
                 self.error_history_count,
             ) = model_args[13:18]
-            if self.error_line_origin_history.shape[1] != 5:
+            if self.error_line_origin_history.shape[1] != 1:
                 self.init_error_history()
         else:
             self.init_error_history()
+
+        if len(model_args) >= 20:
+            self._gaussian_uid = model_args[18]
+            self._next_gaussian_uid = int(model_args[19])
+        else:
+            self.init_gaussian_uids()
 
         self.optimizer.load_state_dict(opt_dict)
 
@@ -199,6 +209,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self._gaussian_scene_num = torch.zeros((fused_point_cloud.shape[0], 1), device="cuda")
+        self.init_gaussian_uids()
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
         self.pretrained_exposures = None
@@ -243,19 +254,39 @@ class GaussianModel:
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
                                                         max_steps=training_args.iterations)
 
+    def init_gaussian_uids(self):
+        """Assign stable IDs that remain attached to Gaussians through pruning."""
+        n = self._xyz.shape[0]
+        self._gaussian_uid = torch.arange(
+            n, dtype=torch.int64, device=self._xyz.device
+        )
+        self._next_gaussian_uid = int(n)
+
+    def append_gaussian_uids(self, count):
+        if count <= 0:
+            return
+        new_ids = torch.arange(
+            self._next_gaussian_uid,
+            self._next_gaussian_uid + count,
+            dtype=torch.int64,
+            device=self._xyz.device,
+        )
+        self._gaussian_uid = torch.cat((self._gaussian_uid, new_ids))
+        self._next_gaussian_uid += count
+
     def init_error_history(self):
         n = self._xyz.shape[0]
         device = self._xyz.device
 
-        # Recent world-space versions of camera-space z-parallel lines.
+        # The most recent world-space camera-space z-parallel line.
         self.error_line_origin_history = torch.zeros(
-            (n, 5, 3), dtype=self._xyz.dtype, device=device
+            (n, 1, 3), dtype=self._xyz.dtype, device=device
         )
         self.error_line_dir_history = torch.zeros(
-            (n, 5, 3), dtype=self._xyz.dtype, device=device
+            (n, 1, 3), dtype=self._xyz.dtype, device=device
         )
         self.error_camera_history = torch.full(
-            (n, 5), -1, dtype=torch.int32, device=device
+            (n, 1), -1, dtype=torch.int32, device=device
         )
         self.error_history_ptr = torch.zeros(
             n, dtype=torch.int64, device=device
@@ -368,6 +399,7 @@ class GaussianModel:
         self._gaussian_scene_num = torch.tensor(np.asarray(plydata.elements[0]["gaussian_scene_num"]), dtype=torch.float,device="cuda").reshape(-1, 1)
         self.active_sh_degree = self.max_sh_degree
 
+        self.init_gaussian_uids()
         self.init_error_history()
 
 
@@ -416,6 +448,7 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self._gaussian_scene_num =  self._gaussian_scene_num[valid_points_mask]
+        self._gaussian_uid = self._gaussian_uid[valid_points_mask]
         self.error_line_origin_history = self.error_line_origin_history[valid_points_mask]
         self.error_line_dir_history = self.error_line_dir_history[valid_points_mask]
         self.error_camera_history = self.error_camera_history[valid_points_mask]
@@ -469,17 +502,18 @@ class GaussianModel:
         self._gaussian_scene_num = torch.cat((self._gaussian_scene_num,new_gaussian_scene_num))
         num_new = new_xyz.shape[0]
         device = self._xyz.device
+        self.append_gaussian_uids(num_new)
         self.error_line_origin_history = torch.cat((
             self.error_line_origin_history,
-            torch.zeros(num_new, 5, 3, dtype=self._xyz.dtype, device=device),
+            torch.zeros(num_new, 1, 3, dtype=self._xyz.dtype, device=device),
         ))
         self.error_line_dir_history = torch.cat((
             self.error_line_dir_history,
-            torch.zeros(num_new, 5, 3, dtype=self._xyz.dtype, device=device),
+            torch.zeros(num_new, 1, 3, dtype=self._xyz.dtype, device=device),
         ))
         self.error_camera_history = torch.cat((
             self.error_camera_history,
-            torch.full((num_new, 5), -1, dtype=torch.int32, device=device),
+            torch.full((num_new, 1), -1, dtype=torch.int32, device=device),
         ))
         self.error_history_ptr = torch.cat((
             self.error_history_ptr,
@@ -507,7 +541,7 @@ class GaussianModel:
         flagged = self._gaussian_scene_num[:, 0] > 0.5
 
         normal_split_limit = self.percent_dense * scene_extent
-        flagged_split_limit = 0.5 * normal_split_limit  # Flagged-specific scale threshold
+        flagged_split_limit = normal_split_limit  # *0.5 Flagged-specific scale threshold
 
         split_limit = torch.where(
             flagged,
@@ -573,7 +607,7 @@ class GaussianModel:
         flagged = self._gaussian_scene_num[:, 0] > 0.5
 
         normal_clone_limit = self.percent_dense * scene_extent
-        flagged_clone_limit = 0.5 * normal_clone_limit  # Same flagged threshold as split
+        flagged_clone_limit = normal_clone_limit  # 0.5 *  Same flagged threshold as split
 
         clone_limit = torch.where(
             flagged,
