@@ -63,6 +63,7 @@ class GaussianModel:
         self._next_gaussian_uid = 0
 
         self.max_radii2D = torch.empty(0)
+        self.tmp_radii = None
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
@@ -642,6 +643,134 @@ class GaussianModel:
             new_tmp_radii,
             new_gaussian_scene_num,
         )
+
+    @torch.no_grad()
+    def random_split_explore(self, num_explore=20, candidate_mask=None, N=2):
+        """Randomly split large-scale Gaussians, optionally within a camera mask.
+
+        If candidate_mask is provided, only True Gaussians can be selected.
+        Selection probability within that set is proportional to mean physical scale.
+        """
+        point_count = self._xyz.shape[0]
+        if point_count == 0 or num_explore <= 0:
+            return 0
+        if N < 2:
+            raise ValueError("N must be at least 2 for splitting")
+
+        if candidate_mask is None:
+            eligible_mask = torch.ones(
+                point_count, dtype=torch.bool, device=self._xyz.device
+            )
+        else:
+            eligible_mask = torch.as_tensor(
+                candidate_mask, device=self._xyz.device
+            ).reshape(-1).bool()
+            if eligible_mask.numel() != point_count:
+                raise ValueError(
+                    f"candidate_mask has {eligible_mask.numel()} entries, "
+                    f"but the model has {point_count} Gaussians"
+                )
+
+        candidate_idx = torch.where(eligible_mask)[0]
+        split_count = min(int(num_explore), candidate_idx.numel())
+        if split_count == 0:
+            return 0
+
+        # Prefer larger Gaussians, but do not impose a hard scale threshold.
+        scores = self.get_scaling.mean(dim=-1).clamp(min=1e-8)
+        candidate_scores = scores[candidate_idx]
+        candidate_scores = torch.nan_to_num(
+            candidate_scores, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        if candidate_scores.sum() <= 0:
+            candidate_scores = torch.ones_like(candidate_scores)
+        sample_idx = candidate_idx[
+            torch.multinomial(
+                candidate_scores / candidate_scores.sum(),
+                num_samples=split_count,
+                replacement=False,
+            )
+        ]
+
+        selected_pts_mask = torch.zeros(
+            point_count, dtype=torch.bool, device=self._xyz.device
+        )
+        selected_pts_mask[sample_idx] = True
+
+        # Keep existing densification statistics. densification_postfix resets
+        # them globally, which would otherwise break interval-based ADC when
+        # random splitting runs every iteration.
+        old_gradient_accum = self.xyz_gradient_accum.clone()
+        old_denom = self.denom.clone()
+        old_max_radii2D = self.max_radii2D.clone()
+
+        if self.tmp_radii is None:
+            self.tmp_radii = torch.zeros(
+                point_count, dtype=self._xyz.dtype, device=self._xyz.device
+            )
+        parent_tmp_radii = self.tmp_radii[selected_pts_mask].clone()
+
+        selected_scaling = self.get_scaling[selected_pts_mask]
+        stds = selected_scaling.repeat(N, 1)
+        samples = torch.normal(mean=torch.zeros_like(stds), std=stds)
+        rotations = build_rotation(
+            self._rotation[selected_pts_mask]
+        ).repeat(N, 1, 1)
+        parent_xyz = self._xyz[selected_pts_mask].repeat(N, 1)
+        new_xyz = (
+            torch.bmm(rotations, samples.unsqueeze(-1)).squeeze(-1) + parent_xyz
+        )
+
+        new_scaling = self.scaling_inverse_activation(
+            selected_scaling.repeat(N, 1) / (0.8 * N)
+        )
+        new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
+        new_opacities = self._opacity[selected_pts_mask].repeat(N, 1)
+        new_tmp_radii = parent_tmp_radii.repeat(N)
+        new_gaussian_scene_num = self._gaussian_scene_num[
+            selected_pts_mask
+        ].repeat(N, 1)
+
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            new_tmp_radii,
+            new_gaussian_scene_num,
+        )
+
+        # Restore statistics for old points and inherit the parent's statistics
+        # for children before removing the selected parents.
+        self.xyz_gradient_accum = torch.cat(
+            (old_gradient_accum, old_gradient_accum[selected_pts_mask].repeat(N, 1)),
+            dim=0,
+        )
+        self.denom = torch.cat(
+            (old_denom, old_denom[selected_pts_mask].repeat(N, 1)), dim=0
+        )
+        self.max_radii2D = torch.cat(
+            (old_max_radii2D, old_max_radii2D[selected_pts_mask].repeat(N)),
+            dim=0,
+        )
+
+        prune_filter = torch.cat(
+            (
+                selected_pts_mask,
+                torch.zeros(
+                    N * split_count, dtype=torch.bool, device=self._xyz.device
+                ),
+            )
+        )
+        self.prune_points(prune_filter)
+        self.tmp_radii = None
+
+        return split_count
+
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
